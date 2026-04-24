@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# VSCode
+.vscode/
+
+# Docker
+*.log
+docker-compose.override.yml
+docker-compose.yml
+
+# System
+.DS_Store
+Thumbs.db
