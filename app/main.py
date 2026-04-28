@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree as ET
 
@@ -22,6 +22,50 @@ CAL_DAV_URL = os.environ.get("CAL_DAV_URL", "https://radicale.example.com/user/c
 CAL_DAV_USER = os.environ.get("CAL_DAV_USER", "user")
 CAL_DAV_PASS = os.environ.get("CAL_DAV_PASS", "pass")
 TZ = os.environ.get("TZ", "UTC")
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name, default, minimum=0):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r, using default=%s", name, raw, default)
+        return default
+
+
+ENABLE_CALDAV_TO_ODOO = _env_bool("ENABLE_CALDAV_TO_ODOO", True)
+IMPORT_UNMANAGED_CALDAV = _env_bool("IMPORT_UNMANAGED_CALDAV", True)
+SYNC_DRY_RUN = _env_bool("SYNC_DRY_RUN", False)
+
+MAX_ODOO_TO_CALDAV_CREATE = _env_int("MAX_ODOO_TO_CALDAV_CREATE", 200)
+MAX_ODOO_TO_CALDAV_UPDATE = _env_int("MAX_ODOO_TO_CALDAV_UPDATE", 200)
+MAX_ODOO_TO_CALDAV_DELETE = _env_int("MAX_ODOO_TO_CALDAV_DELETE", 200)
+
+MAX_CALDAV_TO_ODOO_CREATE = _env_int("MAX_CALDAV_TO_ODOO_CREATE", 50)
+MAX_CALDAV_TO_ODOO_UPDATE = _env_int("MAX_CALDAV_TO_ODOO_UPDATE", 200)
+MAX_CALDAV_IMPORT_CANDIDATES = _env_int("MAX_CALDAV_IMPORT_CANDIDATES", 50)
+
+ODOO_EVENT_FIELDS = [
+    "id",
+    "name",
+    "start",
+    "stop",
+    "allday",
+    "location",
+    "videocall_location",
+    "description",
+    "write_date",
+    "active",
+]
 
 # Prefer minute-based interval, keep legacy SYNC_INTERVAL_HOURS as fallback.
 raw_interval_minutes = os.environ.get("SYNC_INTERVAL_MINUTES")
@@ -109,6 +153,65 @@ def _to_compare_value(value):
     return value
 
 
+def _to_utc_naive_datetime(value, assume_local_for_naive=False):
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        if assume_local_for_naive:
+            return value.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_datetime_value(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, datetime):
+        return raw_value
+    if isinstance(raw_value, date):
+        return datetime.combine(raw_value, datetime.min.time())
+
+    text = _normalize_text(str(raw_value))
+    if not text:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if fmt == "%Y-%m-%d":
+                return datetime.combine(parsed.date(), datetime.min.time())
+            return parsed
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _caldav_last_change_utc(caldav_event):
+    vevent = caldav_event["vevent"]
+    candidates = [
+        _vevent_value(vevent, "last_modified"),
+        _vevent_value(vevent, "dtstamp"),
+    ]
+    for candidate in candidates:
+        parsed = _parse_datetime_value(candidate)
+        normalized = _to_utc_naive_datetime(parsed, assume_local_for_naive=True)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _odoo_write_date_utc(odoo_event):
+    parsed = _parse_datetime_value(odoo_event.get("write_date"))
+    # Odoo write_date is UTC stored without tzinfo.
+    return _to_utc_naive_datetime(parsed, assume_local_for_naive=False)
+
+
 def _extract_vevent(ics_text):
     if not ics_text:
         return None
@@ -134,23 +237,15 @@ def _caldav_collection_url():
     return f"{CAL_DAV_URL.rstrip('/')}/"
 
 
-def get_odoo_events():
+def _get_odoo():
+    return OdooRpcConnector().get()
+
+
+def get_odoo_events(odoo=None):
     try:
-        odoo = OdooRpcConnector().get()
-        fields = [
-            "id",
-            "name",
-            "start",
-            "stop",
-            "allday",
-            "location",
-            "videocall_location",
-            "description",
-            "write_date",
-            "active"
-        ]
+        odoo = odoo or _get_odoo()
         domain = [["active", "=", True], ["partner_ids.user_ids", "=", odoo.env.uid]]
-        events = odoo.env["calendar.event"].search_read(domain, fields)
+        events = odoo.env["calendar.event"].search_read(domain, ODOO_EVENT_FIELDS)
         logger.info("Fetched %s events from Odoo.", len(events))
         return events
     except Exception as ex:
@@ -290,6 +385,184 @@ def get_caldav_events():
     return events
 
 
+def _vevent_value(vevent, key, default=None):
+    return getattr(getattr(vevent, key, None), "value", default)
+
+
+def _odoo_time_window(odoo_event):
+    odoo_start = _to_local_naive(_parse_odoo_dt(odoo_event.get("start")))
+    odoo_end = _to_local_naive(_parse_odoo_dt(odoo_event.get("stop")))
+    if odoo_event.get("allday"):
+        if isinstance(odoo_start, datetime):
+            odoo_start = odoo_start.date()
+        if isinstance(odoo_end, datetime):
+            odoo_end = odoo_end.date()
+    return _to_compare_value(odoo_start), _to_compare_value(odoo_end)
+
+
+def _caldav_time_window(caldav_event):
+    vevent = caldav_event["vevent"]
+    existing_start = _to_compare_value(_vevent_value(vevent, "dtstart"))
+    existing_end = _to_compare_value(_vevent_value(vevent, "dtend"))
+    return existing_start, existing_end
+
+
+def _event_projection_from_odoo(odoo_event):
+    odoo_start, odoo_end = _odoo_time_window(odoo_event)
+    return {
+        "summary": _normalize_text(odoo_event.get("name")),
+        "description": _build_description(odoo_event),
+        "location": _normalize_text(odoo_event.get("location")),
+        "meeting_url": _normalize_text(odoo_event.get("videocall_location")),
+        "start": odoo_start,
+        "end": odoo_end,
+    }
+
+
+def _event_projection_from_caldav(caldav_event):
+    vevent = caldav_event["vevent"]
+    existing_start, existing_end = _caldav_time_window(caldav_event)
+    return {
+        "summary": _normalize_text(_vevent_value(vevent, "summary", "")),
+        "description": _normalize_text(_vevent_value(vevent, "description", "")),
+        "location": _normalize_text(_vevent_value(vevent, "location", "")),
+        "meeting_url": _normalize_text(_vevent_value(vevent, "url", "")),
+        "start": existing_start,
+        "end": existing_end,
+    }
+
+
+def _events_are_equal(odoo_event, caldav_event):
+    return _event_projection_from_odoo(odoo_event) == _event_projection_from_caldav(caldav_event)
+
+
+def _odoo_should_push_version(odoo_event, caldav_event):
+    odoo_write_date = _normalize_text(odoo_event.get("write_date"))
+    existing_write_date = _normalize_text(caldav_event.get("x_odoo_write_date"))
+    if not existing_write_date:
+        return True
+    if not (odoo_write_date and odoo_write_date != existing_write_date):
+        return False
+
+    odoo_write_at = _odoo_write_date_utc(odoo_event)
+    caldav_changed_at = _caldav_last_change_utc(caldav_event)
+
+    # If CalDAV event changed after Odoo write_date, prefer pulling CalDAV into Odoo.
+    if odoo_write_at is not None and caldav_changed_at is not None and caldav_changed_at > odoo_write_at:
+        return False
+    return True
+
+
+def _odoo_dt_to_string(value):
+    if isinstance(value, datetime):
+        # Odoo datetime fields are stored as UTC naive values.
+        # Floating CalDAV datetimes are interpreted in LOCAL_TZ first.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=LOCAL_TZ)
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return ""
+
+
+def _default_end_for_start(start_value):
+    if isinstance(start_value, datetime):
+        return start_value + timedelta(hours=1)
+    if isinstance(start_value, date):
+        return start_value + timedelta(days=1)
+    return None
+
+
+def _caldav_event_to_odoo_payload(caldav_event, odoo_uid):
+    vevent = caldav_event["vevent"]
+    name = _normalize_text(_vevent_value(vevent, "summary", ""))
+    start = _vevent_value(vevent, "dtstart")
+    stop = _vevent_value(vevent, "dtend")
+    if stop is None:
+        stop = _default_end_for_start(start)
+
+    if not name or start is None or stop is None:
+        return None
+
+    allday = isinstance(start, date) and not isinstance(start, datetime)
+    payload = {
+        "name": name,
+        "start": _odoo_dt_to_string(start),
+        "stop": _odoo_dt_to_string(stop),
+        "allday": allday,
+        "location": _normalize_text(_vevent_value(vevent, "location", "")) or False,
+        "videocall_location": _normalize_text(_vevent_value(vevent, "url", "")) or False,
+        "description": _normalize_text(_vevent_value(vevent, "description", "")) or False,
+        "active": True,
+        "user_id": odoo_uid,
+    }
+    if not payload["start"] or not payload["stop"]:
+        return None
+    return payload
+
+
+def _read_odoo_event(odoo, event_id):
+    records = odoo.env["calendar.event"].search_read([["id", "=", int(event_id)]], ODOO_EVENT_FIELDS)
+    return records[0] if records else None
+
+
+def create_or_update_odoo_event(odoo, caldav_event, existing_odoo_event=None):
+    payload = _caldav_event_to_odoo_payload(caldav_event, odoo.env.uid)
+    if payload is None:
+        logger.warning("Skipping CalDAV->Odoo sync due to missing required fields for href=%s", caldav_event.get("href"))
+        return None
+
+    model = odoo.env["calendar.event"]
+    if existing_odoo_event:
+        event_id = int(existing_odoo_event["id"])
+        logger.info("Updating Odoo event id=%s from CalDAV href=%s", event_id, caldav_event.get("href"))
+        model.browse(event_id).write(payload)
+        return _read_odoo_event(odoo, event_id)
+
+    logger.info("Creating Odoo event from CalDAV href=%s", caldav_event.get("href"))
+    event_id = model.create(payload)
+    return _read_odoo_event(odoo, event_id)
+
+
+def _event_fingerprint_from_odoo(odoo_event):
+    start, end = _odoo_time_window(odoo_event)
+    if start is None or end is None:
+        return None
+    return (
+        _normalize_text(odoo_event.get("name")).lower(),
+        start,
+        end,
+        bool(odoo_event.get("allday")),
+    )
+
+
+def _event_fingerprint_from_caldav(caldav_event):
+    vevent = caldav_event["vevent"]
+    start, end = _caldav_time_window(caldav_event)
+    if start is None or end is None:
+        return None
+    return (
+        _normalize_text(_vevent_value(vevent, "summary", "")).lower(),
+        start,
+        end,
+        isinstance(_vevent_value(vevent, "dtstart"), date) and not isinstance(_vevent_value(vevent, "dtstart"), datetime),
+    )
+
+
+def _build_caldav_indexes(caldav_events):
+    by_uid = {}
+    by_odoo_id = {}
+    for event in caldav_events:
+        uid = _normalize_text(event.get("uid"))
+        odoo_id = _normalize_text(event.get("x_odoo_id"))
+        if uid and uid not in by_uid:
+            by_uid[uid] = event
+        if odoo_id and odoo_id not in by_odoo_id:
+            by_odoo_id[odoo_id] = event
+    return by_uid, by_odoo_id
+
+
 def find_existing_event(caldav_events, odoo_event):
     target_uid = _event_uid(odoo_event["id"])
     target_id = str(odoo_event["id"])
@@ -338,46 +611,7 @@ def delete_caldav_event(caldav_event):
 
 
 def event_needs_update(odoo_event, caldav_event):
-    vevent = caldav_event["vevent"]
-
-    summary = _normalize_text(getattr(getattr(vevent, "summary", None), "value", ""))
-    description = _normalize_text(getattr(getattr(vevent, "description", None), "value", ""))
-    location = _normalize_text(getattr(getattr(vevent, "location", None), "value", ""))
-    meeting_url = _normalize_text(getattr(getattr(vevent, "url", None), "value", ""))
-
-    existing_start = _to_compare_value(getattr(getattr(vevent, "dtstart", None), "value", None))
-    existing_end = _to_compare_value(getattr(getattr(vevent, "dtend", None), "value", None))
-
-    odoo_start = _to_local_naive(_parse_odoo_dt(odoo_event.get("start")))
-    odoo_end = _to_local_naive(_parse_odoo_dt(odoo_event.get("stop")))
-    odoo_description = _build_description(odoo_event)
-    odoo_meeting_url = _normalize_text(odoo_event.get("videocall_location"))
-    odoo_write_date = _normalize_text(odoo_event.get("write_date"))
-    existing_write_date = _normalize_text(caldav_event.get("x_odoo_write_date"))
-
-    if odoo_write_date and existing_write_date and odoo_write_date != existing_write_date:
-        return True
-
-    if odoo_event.get("allday"):
-        if isinstance(odoo_start, datetime):
-            odoo_start = odoo_start.date()
-        if isinstance(odoo_end, datetime):
-            odoo_end = odoo_end.date()
-
-    if summary != _normalize_text(odoo_event.get("name")):
-        return True
-    if description != odoo_description:
-        return True
-    if location != _normalize_text(odoo_event.get("location")):
-        return True
-    if meeting_url != odoo_meeting_url:
-        return True
-    if existing_start != _to_compare_value(odoo_start):
-        return True
-    if existing_end != _to_compare_value(odoo_end):
-        return True
-
-    return False
+    return not _events_are_equal(odoo_event, caldav_event) or _odoo_should_push_version(odoo_event, caldav_event)
 
 
 def _normalize_for_vobject(value):
@@ -387,8 +621,8 @@ def _normalize_for_vobject(value):
     return value
 
 
-def event_to_ics(odoo_event):
-    uid = _event_uid(odoo_event["id"])
+def event_to_ics(odoo_event, preferred_uid=None):
+    uid = _normalize_text(preferred_uid) or _event_uid(odoo_event["id"])
     name = _normalize_text(odoo_event.get("name"))
     start = _to_local_naive(_parse_odoo_dt(odoo_event.get("start")))
     stop = _to_local_naive(_parse_odoo_dt(odoo_event.get("stop")))
@@ -442,7 +676,8 @@ def event_to_ics(odoo_event):
 
 def create_or_update_event(odoo_event, existing_event=None):
     try:
-        ics_payload, uid = event_to_ics(odoo_event)
+        preferred_uid = _normalize_text(existing_event.get("uid")) if existing_event else None
+        ics_payload, uid = event_to_ics(odoo_event, preferred_uid=preferred_uid)
     except Exception as ex:
         logger.error("Skipping event id=%s due to invalid ICS data: %s", odoo_event.get("id"), ex)
         return
@@ -450,7 +685,9 @@ def create_or_update_event(odoo_event, existing_event=None):
     headers = {"Content-Type": "text/calendar; charset=utf-8"}
 
     if existing_event:
-        filename = existing_event["href"].split("/")[-1]
+        filename = _normalize_text(existing_event.get("href")).split("/")[-1]
+        if not filename:
+            filename = f"{_safe_filename(uid)}.ics"
         url = f"{CAL_DAV_URL.rstrip('/')}/{filename}"
         logger.info("Updating CalDAV event id=%s at %s", odoo_event["id"], url)
     else:
@@ -471,51 +708,166 @@ def create_or_update_event(odoo_event, existing_event=None):
 
 
 def sync_calendar_events():
-    odoo_events = get_odoo_events()
+    odoo = _get_odoo()
+    odoo_events = get_odoo_events(odoo)
     caldav_events = get_caldav_events()
 
     odoo_ids = {str(event.get("id")) for event in odoo_events if event.get("id") is not None}
-    created_count = 0
-    updated_count = 0
-    deleted_count = 0
+    odoo_by_id = {str(event["id"]): event for event in odoo_events if event.get("id") is not None}
+    odoo_fp = {}
+    for event in odoo_events:
+        fp = _event_fingerprint_from_odoo(event)
+        if fp is not None and fp not in odoo_fp:
+            odoo_fp[fp] = event
+
+    uid_index, odoo_id_index = _build_caldav_indexes(caldav_events)
+    matched_hrefs = set()
+
+    odoo_to_caldav_created = 0
+    odoo_to_caldav_updated = 0
+    odoo_to_caldav_deleted = 0
+    caldav_to_odoo_created = 0
+    caldav_to_odoo_updated = 0
 
     for event in odoo_events:
-        existing_event = find_existing_event(caldav_events, event)
+        event_id = str(event["id"])
+        existing_event = uid_index.get(_event_uid(event_id)) or odoo_id_index.get(event_id)
+        if existing_event:
+            matched_hrefs.add(_normalize_text(existing_event.get("href")))
+
         try:
-            if existing_event:
-                if event_needs_update(event, existing_event):
-                    create_or_update_event(event, existing_event)
-                    updated_count += 1
+            if not existing_event:
+                if odoo_to_caldav_created >= MAX_ODOO_TO_CALDAV_CREATE:
+                    logger.warning("Skipping Odoo->CalDAV create due to MAX_ODOO_TO_CALDAV_CREATE=%s", MAX_ODOO_TO_CALDAV_CREATE)
+                    continue
+                if SYNC_DRY_RUN:
+                    logger.info("[DRY-RUN] Would create CalDAV event for Odoo id=%s", event_id)
                 else:
-                    logger.info("No update needed for event id=%s", event["id"])
+                    create_or_update_event(event, None)
+                odoo_to_caldav_created += 1
+                continue
+
+            if not event_needs_update(event, existing_event):
+                logger.info("No update needed for event id=%s", event_id)
+                continue
+
+            if _odoo_should_push_version(event, existing_event) or not ENABLE_CALDAV_TO_ODOO:
+                if odoo_to_caldav_updated >= MAX_ODOO_TO_CALDAV_UPDATE:
+                    logger.warning("Skipping Odoo->CalDAV update due to MAX_ODOO_TO_CALDAV_UPDATE=%s", MAX_ODOO_TO_CALDAV_UPDATE)
+                    continue
+                if SYNC_DRY_RUN:
+                    logger.info("[DRY-RUN] Would update CalDAV event for Odoo id=%s", event_id)
+                else:
+                    create_or_update_event(event, existing_event)
+                odoo_to_caldav_updated += 1
             else:
-                create_or_update_event(event, None)
-                created_count += 1
+                if caldav_to_odoo_updated >= MAX_CALDAV_TO_ODOO_UPDATE:
+                    logger.warning("Skipping CalDAV->Odoo update due to MAX_CALDAV_TO_ODOO_UPDATE=%s", MAX_CALDAV_TO_ODOO_UPDATE)
+                    continue
+                if SYNC_DRY_RUN:
+                    logger.info("[DRY-RUN] Would update Odoo event id=%s from CalDAV href=%s", event_id, existing_event.get("href"))
+                else:
+                    updated_odoo_event = create_or_update_odoo_event(odoo, existing_event, existing_odoo_event=event)
+                    if updated_odoo_event:
+                        odoo_by_id[event_id] = updated_odoo_event
+                        updated_fp = _event_fingerprint_from_odoo(updated_odoo_event)
+                        if updated_fp is not None:
+                            odoo_fp[updated_fp] = updated_odoo_event
+                        create_or_update_event(updated_odoo_event, existing_event)
+                caldav_to_odoo_updated += 1
         except Exception as ex:
-            logger.error("Failed to sync Odoo event id=%s: %s", event.get("id"), ex)
+            logger.error("Failed to sync linked event id=%s: %s", event_id, ex)
 
+    unmanaged_candidates = []
     for caldav_event in caldav_events:
-        if not _is_managed_caldav_event(caldav_event):
+        href_key = _normalize_text(caldav_event.get("href"))
+        if href_key in matched_hrefs:
             continue
 
-        linked_odoo_id = _caldav_event_odoo_id(caldav_event)
-        if not linked_odoo_id:
-            logger.warning("Skipping managed CalDAV event without identifiable Odoo id: %s", caldav_event.get("href"))
-            continue
-        if linked_odoo_id in odoo_ids:
+        if _is_managed_caldav_event(caldav_event):
+            linked_odoo_id = _caldav_event_odoo_id(caldav_event)
+            if linked_odoo_id in odoo_ids:
+                continue
+            if not linked_odoo_id:
+                logger.warning("Skipping managed CalDAV event without identifiable Odoo id: %s", caldav_event.get("href"))
+                continue
+            try:
+                if odoo_to_caldav_deleted >= MAX_ODOO_TO_CALDAV_DELETE:
+                    logger.warning("Skipping CalDAV delete due to MAX_ODOO_TO_CALDAV_DELETE=%s", MAX_ODOO_TO_CALDAV_DELETE)
+                    continue
+                if SYNC_DRY_RUN:
+                    logger.info("[DRY-RUN] Would delete stale managed CalDAV event href=%s", caldav_event.get("href"))
+                else:
+                    if delete_caldav_event(caldav_event):
+                        odoo_to_caldav_deleted += 1
+                        continue
+                odoo_to_caldav_deleted += 1
+            except Exception as ex:
+                logger.error("Failed to delete stale CalDAV event href=%s: %s", caldav_event.get("href"), ex)
             continue
 
-        try:
-            if delete_caldav_event(caldav_event):
-                deleted_count += 1
-        except Exception as ex:
-            logger.error("Failed to delete stale CalDAV event href=%s: %s", caldav_event.get("href"), ex)
+        if ENABLE_CALDAV_TO_ODOO and IMPORT_UNMANAGED_CALDAV:
+            unmanaged_candidates.append(caldav_event)
+
+    if ENABLE_CALDAV_TO_ODOO and IMPORT_UNMANAGED_CALDAV and unmanaged_candidates:
+        if len(unmanaged_candidates) > MAX_CALDAV_IMPORT_CANDIDATES:
+            logger.error(
+                "Skipping unmanaged CalDAV import because candidate count=%s exceeds MAX_CALDAV_IMPORT_CANDIDATES=%s",
+                len(unmanaged_candidates),
+                MAX_CALDAV_IMPORT_CANDIDATES,
+            )
+        else:
+            for caldav_event in unmanaged_candidates:
+                if caldav_to_odoo_created >= MAX_CALDAV_TO_ODOO_CREATE:
+                    logger.warning("Skipping CalDAV->Odoo create due to MAX_CALDAV_TO_ODOO_CREATE=%s", MAX_CALDAV_TO_ODOO_CREATE)
+                    break
+
+                fp = _event_fingerprint_from_caldav(caldav_event)
+                duplicate_odoo = odoo_fp.get(fp) if fp is not None else None
+
+                try:
+                    if duplicate_odoo:
+                        logger.info(
+                            "Linking existing Odoo event id=%s with unmanaged CalDAV href=%s",
+                            duplicate_odoo.get("id"),
+                            caldav_event.get("href"),
+                        )
+                        if SYNC_DRY_RUN:
+                            logger.info("[DRY-RUN] Would stamp metadata to CalDAV href=%s", caldav_event.get("href"))
+                        else:
+                            create_or_update_event(duplicate_odoo, caldav_event)
+                        continue
+
+                    if SYNC_DRY_RUN:
+                        logger.info("[DRY-RUN] Would create Odoo event from unmanaged CalDAV href=%s", caldav_event.get("href"))
+                        caldav_to_odoo_created += 1
+                        continue
+
+                    created_odoo_event = create_or_update_odoo_event(odoo, caldav_event, existing_odoo_event=None)
+                    if not created_odoo_event:
+                        continue
+
+                    caldav_to_odoo_created += 1
+                    created_id = str(created_odoo_event["id"])
+                    odoo_ids.add(created_id)
+                    odoo_by_id[created_id] = created_odoo_event
+                    created_fp = _event_fingerprint_from_odoo(created_odoo_event)
+                    if created_fp is not None:
+                        odoo_fp[created_fp] = created_odoo_event
+
+                    # Stamp bridge metadata back to the same CalDAV resource to avoid duplicate imports.
+                    create_or_update_event(created_odoo_event, caldav_event)
+                except Exception as ex:
+                    logger.error("Failed to import CalDAV event href=%s into Odoo: %s", caldav_event.get("href"), ex)
 
     logger.info(
-        "Calendar sync finished. created=%s updated=%s deleted=%s",
-        created_count,
-        updated_count,
-        deleted_count,
+        "Calendar sync finished. odoo_to_caldav(created=%s updated=%s deleted=%s) caldav_to_odoo(created=%s updated=%s) dry_run=%s",
+        odoo_to_caldav_created,
+        odoo_to_caldav_updated,
+        odoo_to_caldav_deleted,
+        caldav_to_odoo_created,
+        caldav_to_odoo_updated,
+        SYNC_DRY_RUN,
     )
 
 

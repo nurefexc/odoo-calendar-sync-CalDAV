@@ -7,7 +7,9 @@
 * **Idempotency & Tracking:** Uses custom ICS properties (`X-ODOO-ID` and `X-ODOO-WRITE-DATE`) to track synchronization state without a local database.
 * **Smart Description Merging:** Automatically appends Odoo video call locations to the event description if not already present.
 * **Timezone Aware:** Fully supports global operations using the `zoneinfo` module and explicit timezone handling.
-* **Stale Event Cleanup:** Automatically identifies and removes events from the CalDAV server that have been deleted or archived in Odoo.
+* **Two-Way Sync:** Handles Odoo -> CalDAV and CalDAV -> Odoo updates, including events created in Radicale.
+* **Stale Event Cleanup:** Automatically identifies and removes bridge-managed CalDAV events that were deleted or archived in Odoo.
+* **Safety Guards:** Dry-run support and hard limits prevent accidental mass create/update/delete operations.
 * **Protocol Resilience:** Implements a two-step discovery process (PROPFIND with a fallback to CalDAV REPORT) to ensure compatibility with various server implementations.
 
 ## Architecture
@@ -15,8 +17,8 @@
 The service runs an `APScheduler` loop that performs the following steps:
 1.  **Fetch Odoo Events:** Retrieves active calendar events assigned to the authenticated user.
 2.  **Fetch CalDAV Collection:** Scans the remote calendar for existing managed events.
-3.  **Conflict Resolution:** Compares `write_date` and core fields (summary, location, timing) to determine if an update is required.
-4.  **Atomic Updates:** Performs `PUT` or `DELETE` operations to reconcile the states.
+3.  **Conflict Resolution:** If Odoo `write_date` differs from `X-ODOO-WRITE-DATE`, Odoo wins; otherwise CalDAV changes are pulled back to Odoo.
+4.  **Safe Reconciliation:** Performs bounded `PUT`/`DELETE` (CalDAV) and `create`/`write` (Odoo) operations with duplicate checks.
 
 ## Configuration
 
@@ -29,6 +31,15 @@ The application is configured via environment variables, making it ideal for Doc
 | `CAL_DAV_PASS`          | CalDAV password                            | -       |
 | `TZ`                    | System timezone (e.g., `Europe/Budapest`)  | `UTC`   |
 | `SYNC_INTERVAL_MINUTES` | Frequency of synchronization in minutes    | `15`    |
+| `ENABLE_CALDAV_TO_ODOO` | Enable CalDAV -> Odoo updates/imports     | `true`  |
+| `IMPORT_UNMANAGED_CALDAV` | Import unmanaged/new CalDAV events      | `true`  |
+| `SYNC_DRY_RUN`          | Plan and log actions without writing data  | `false` |
+| `MAX_ODOO_TO_CALDAV_CREATE` | Max Odoo -> CalDAV creates per run    | `200`   |
+| `MAX_ODOO_TO_CALDAV_UPDATE` | Max Odoo -> CalDAV updates per run    | `200`   |
+| `MAX_ODOO_TO_CALDAV_DELETE` | Max CalDAV deletes per run            | `200`   |
+| `MAX_CALDAV_TO_ODOO_CREATE` | Max CalDAV -> Odoo creates per run    | `50`    |
+| `MAX_CALDAV_TO_ODOO_UPDATE` | Max CalDAV -> Odoo updates per run    | `200`   |
+| `MAX_CALDAV_IMPORT_CANDIDATES` | Hard cap on unmanaged import set    | `50`    |
 | `ODOO_URL`              | Odoo server base URL                       | -       |
 | `ODOO_DB`               | Odoo database name                         | -       |
 | `ODOO_USER`             | Odoo login/email                           | -       |
